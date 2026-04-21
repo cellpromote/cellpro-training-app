@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>踏切シミュレーター</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: #1a1a2e;
+    overflow: hidden;
+    font-family: monospace;
+  }
+
+  /* キャンバスを画面全体に */
+  #game-container {
+    position: fixed;
+    inset: 0;
+  }
+  #game-container canvas {
+    display: block;
+  }
+
+  /* タイトル：左上オーバーレイ */
+  #title {
+    position: fixed;
+    top: 10px; left: 50%;
+    transform: translateX(-50%);
+    color: #eee;
+    font-size: clamp(13px, 3vw, 20px);
+    letter-spacing: 2px;
+    text-shadow: 0 1px 4px #000a;
+    pointer-events: none;
+    white-space: nowrap;
+    z-index: 10;
+  }
+
+  /* ボタン：下部オーバーレイ */
+  #controls {
+    position: fixed;
+    bottom: max(16px, env(safe-area-inset-bottom, 16px));
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: clamp(8px, 3vw, 20px);
+    z-index: 10;
+  }
+
+  button {
+    background: #0f3460cc;
+    color: #eee;
+    border: 1.5px solid #e94560;
+    padding: clamp(10px, 2.5vw, 14px) clamp(18px, 5vw, 36px);
+    font-size: clamp(14px, 3.5vw, 18px);
+    font-family: monospace;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    /* タッチ操作向け：最低タップ領域 */
+    min-width: 44px;
+    min-height: 44px;
+    touch-action: manipulation;
+    user-select: none;
+  }
+  button:hover,
+  button:active { background: #e94560cc; }
+</style>
+</head>
+<body>
+
+<div id="title">🚃 踏切シミュレーター</div>
+<div id="game-container"></div>
+<div id="controls">
+  <button id="btn-toggle">遮断機を操作</button>
+  <button id="btn-train">電車を走らせる</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.60.0/phaser.min.js"></script>
+<script>
+// --- 論理解像度（ゲーム内座標系）---
+const W = 700, H = 360;
+
+let armLeft, armRight;
+let armAngle = 0, armAngleTarget = 0;
+let lights = [], lightTimer = 0, lightOn = false;
+let trainGraphics, trainRunning = false, trainX = -300, trainSpeed = 0;
+let gateOpen = true, warningActive = false;
+
+// --- Web Audio ---
+let audioCtx = null;
+let bellInterval = null;
+let trainNoiseNode = null, trainNoiseGain = null;
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+
+function ringBell() {
+  const ctx = getAudioCtx();
+  const t = ctx.currentTime;
+  const freqs = [1480, 2960, 4440];
+  freqs.forEach((freq, i) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, t);
+    const vol = 0.18 / (i + 1);
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+    osc.start(t); osc.stop(t + 0.36);
+  });
+}
+
+function startBell() {
+  if (bellInterval) return;
+  ringBell();
+  bellInterval = setInterval(ringBell, 700);
+}
+
+function stopBell() {
+  if (bellInterval) { clearInterval(bellInterval); bellInterval = null; }
+}
+
+function startTrainSound() {
+  const ctx = getAudioCtx();
+  const bufSize = ctx.sampleRate * 2;
+  const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+
+  trainNoiseNode = ctx.createBufferSource();
+  trainNoiseNode.buffer = buf;
+  trainNoiseNode.loop = true;
+
+  const filter = ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 180;
+
+  trainNoiseGain = ctx.createGain();
+  trainNoiseGain.gain.setValueAtTime(0, ctx.currentTime);
+  trainNoiseGain.gain.linearRampToValueAtTime(0.18, ctx.currentTime + 1.5);
+
+  trainNoiseNode.connect(filter);
+  filter.connect(trainNoiseGain);
+  trainNoiseGain.connect(ctx.destination);
+  trainNoiseNode.start();
+}
+
+function stopTrainSound() {
+  if (trainNoiseGain && audioCtx) {
+    trainNoiseGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 1.0);
+    const node = trainNoiseNode;
+    setTimeout(() => { try { node.stop(); } catch(e){} }, 1100);
+    trainNoiseNode = null; trainNoiseGain = null;
+  }
+}
+
+// --- Phaser 設定 ---
+const config = {
+  type: Phaser.AUTO,
+  width: W,
+  height: H,
+  backgroundColor: '#87CEEB',
+  parent: 'game-container',
+  // ★ ScaleManager でレスポンシブ対応
+  scale: {
+    mode: Phaser.Scale.FIT,          // アスペクト比を保ちながら最大化
+    autoCenter: Phaser.Scale.CENTER_BOTH,  // 縦横中央配置
+    width: W,
+    height: H,
+  },
+  scene: { preload, create, update }
+};
+
+function preload() {}
+
+function create() {
+  const scene = this;
+
+  // --- 背景 ---
+  const bg = scene.add.graphics();
+  bg.fillStyle(0x87CEEB); bg.fillRect(0, 0, W, H);
+  bg.fillStyle(0x8BC34A); bg.fillRect(0, 200, W, H - 200);
+  bg.fillStyle(0x78909C); bg.fillRect(0, 200, W, 80);
+  bg.fillStyle(0xFFFDE7);
+  for (let x = 0; x < W; x += 40) { bg.fillRect(x, 232, 24, 6); }
+  bg.fillStyle(0x5D4037);
+  for (let x = 0; x < W; x += 18) { bg.fillRect(x, 190, 12, 80); }
+  bg.fillStyle(0xB0BEC5); bg.fillRect(0, 196, W, 8);
+  bg.fillStyle(0xB0BEC5); bg.fillRect(0, 250, W, 8);
+  bg.fillStyle(0xEEEEEE);
+  for (let i = 0; i < 6; i++) { bg.fillRect(310, 208 + i * 10, 80, 6); }
+  bg.fillStyle(0x7CB342); bg.fillRect(0, 278, W, H - 278);
+
+  // --- 電柱 ---
+  const poleL = scene.add.graphics();
+  poleL.fillStyle(0xCFD8DC); poleL.fillRect(-5, 0, 10, 140);
+  poleL.x = 285; poleL.y = 20;
+  const poleR = scene.add.graphics();
+  poleR.fillStyle(0xCFD8DC); poleR.fillRect(-5, 0, 10, 140);
+  poleR.x = 415; poleR.y = 20;
+
+  // --- 警告灯ボックス ---
+  function makeLightBox(x, y) {
+    const g = scene.add.graphics();
+    g.fillStyle(0x212121); g.fillRoundedRect(0, 0, 26, 52, 4);
+    g.x = x; g.y = y;
+    return g;
+  }
+  makeLightBox(272, 55);
+  makeLightBox(402, 55);
+
+  // 警告灯
+  lights = [
+    { g: scene.add.graphics(), x: 285, y: 66, on: false, phase: 0 },
+    { g: scene.add.graphics(), x: 285, y: 90, on: false, phase: 1 },
+    { g: scene.add.graphics(), x: 415, y: 66, on: false, phase: 1 },
+    { g: scene.add.graphics(), x: 415, y: 90, on: false, phase: 0 },
+  ];
+  lights.forEach(l => {
+    l.g.x = l.x; l.g.y = l.y;
+    drawLight(l.g, false);
+  });
+
+  // --- 遮断機腕 ---
+  armLeft = scene.add.graphics();
+  armRight = scene.add.graphics();
+  drawArm(armLeft);
+  drawArm(armRight);
+  armLeft.x = 285; armLeft.y = 148;
+  armRight.x = 415; armRight.y = 148;
+
+  // --- 「踏切」看板 ---
+  const sign = scene.add.graphics();
+  sign.fillStyle(0xE53935); sign.fillRect(-30, -14, 60, 28);
+  sign.fillStyle(0xFFFFFF); sign.fillRect(-28, -12, 56, 24);
+  sign.x = 350; sign.y = 35;
+  scene.add.text(350, 35, '踏\n切', {
+    fontSize: '10px', color: '#E53935', fontFamily: 'monospace', align: 'center', lineSpacing: 0
+  }).setOrigin(0.5);
+
+  // --- 電車グラフィクス ---
+  trainGraphics = scene.add.graphics();
+
+  // --- ボタンイベント ---
+  document.getElementById('btn-toggle').addEventListener('click', () => {
+    gateOpen = !gateOpen;
+    armAngleTarget = gateOpen ? 0 : -85;
+    if (!gateOpen) startWarning(); else stopWarning();
+  });
+  document.getElementById('btn-train').addEventListener('click', () => {
+    if (!trainRunning) {
+      trainRunning = true; trainX = -500; trainSpeed = 2.5;
+      gateOpen = false; armAngleTarget = -85; startWarning();
+      startTrainSound();
+    }
+  });
+}
+
+function drawArm(g) {
+  g.clear();
+  const totalW = 170, stripeW = 22;
+  for (let i = 0; i * stripeW < totalW; i++) {
+    g.fillStyle(i % 2 === 0 ? 0xE53935 : 0xFFFFFF);
+    const sx = i * stripeW;
+    const sw = Math.min(stripeW, totalW - sx);
+    g.fillRect(sx, -5, sw, 10);
+  }
+  g.fillStyle(0x333333); g.fillCircle(0, 0, 8);
+}
+
+function drawLight(g, on) {
+  g.clear();
+  g.fillStyle(on ? 0xFF1744 : 0x440000);
+  g.fillCircle(0, 0, 9);
+  if (on) {
+    g.fillStyle(0xFF6B6B);
+    g.fillCircle(-3, -3, 3);
+  }
+}
+
+function drawTrain(g, x, y) {
+  g.clear();
+  const cars = [
+    { ox: 0,   w: 150, h: 52, col: 0x1565C0 },
+    { ox: 158, w: 130, h: 48, col: 0x1976D2 },
+    { ox: 296, w: 130, h: 48, col: 0x1976D2 },
+    { ox: 434, w: 110, h: 48, col: 0x1565C0 },
+  ];
+  cars.forEach((c, ci) => {
+    const cx = x + c.ox;
+    g.fillStyle(c.col); g.fillRoundedRect(cx, y, c.w, c.h, 5);
+    g.fillStyle(0xE3F2FD);
+    for (let wi = 0; wi < 4; wi++) {
+      const wx = cx + 10 + wi * (c.w - 20) / 4;
+      if (wx + 20 < cx + c.w - 5) g.fillRoundedRect(wx, y + 8, 20, 14, 2);
+    }
+    g.fillStyle(0x0D47A1); g.fillRect(cx, y + c.h - 8, c.w, 8);
+    g.fillStyle(0x263238); g.fillRect(cx, y + c.h, c.w, 8);
+    [cx + 18, cx + c.w - 18].forEach(wx => {
+      g.fillStyle(0x212121); g.fillCircle(wx, y + c.h + 8, 10);
+      g.fillStyle(0x607D8B); g.fillCircle(wx, y + c.h + 8, 6);
+      g.fillStyle(0xCFD8DC); g.fillCircle(wx, y + c.h + 8, 2);
+    });
+    if (ci < cars.length - 1) {
+      g.fillStyle(0x455A64);
+      g.fillRect(cx + c.w, y + c.h / 2 - 3, 8, 6);
+    }
+  });
+  g.fillStyle(0xFFEE58); g.fillCircle(x + 10, y + 14, 7);
+  g.fillStyle(0xFFFFFF); g.fillCircle(x + 10, y + 14, 4);
+  g.lineStyle(2, 0x9E9E9E);
+  g.strokeRect(x + 20, y - 20, 30, 20);
+  g.strokeRect(x + 25, y - 30, 20, 12);
+}
+
+function startWarning() { warningActive = true; startBell(); }
+function stopWarning() {
+  warningActive = false; lightOn = false;
+  lights.forEach(l => { l.on = false; drawLight(l.g, false); });
+  stopBell();
+}
+
+function update(time, delta) {
+  if (warningActive) {
+    lightTimer += delta;
+    if (lightTimer > 350) {
+      lightTimer = 0; lightOn = !lightOn;
+      lights.forEach(l => {
+        l.on = (l.phase === 0) ? lightOn : !lightOn;
+        drawLight(l.g, l.on);
+      });
+    }
+  }
+
+  const da = armAngleTarget - armAngle;
+  armAngle += da * 0.07;
+  armLeft.angle = armAngle;
+  armRight.angle = -armAngle;
+
+  if (trainRunning) {
+    trainX += trainSpeed;
+    if (trainX > -100 && trainX < W + 100) trainSpeed = Math.min(trainSpeed + 0.015, 4.5);
+    drawTrain(trainGraphics, trainX, 155);
+    if (trainX > W + 200) {
+      trainRunning = false;
+      trainGraphics.clear();
+      gateOpen = true; armAngleTarget = 0;
+      stopWarning();
+      stopTrainSound();
+    }
+  }
+}
+
+new Phaser.Game(config);
+</script>
+</body>
+</html>
